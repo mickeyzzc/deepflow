@@ -183,7 +183,7 @@ type VM struct {
 	HType          int    `gorm:"column:htype;type:int;default:1" json:"HTYPE"`                 // 1.vm-c 2.bm-c 3.vm-n 4.bm-n 5.vm-s 6.bm-s
 	LaunchServer   string `gorm:"index:state_server_index;column:launch_server;type:char(64);default:''" json:"LAUNCH_SERVER"`
 	CloudTags      string `gorm:"column:cloud_tags;type:text;default:''" json:"CLOUD_TAGS"` // separated by ,
-	VPCID          int    `gorm:"column:epc_id;type:int;default:0" json:"VPC_ID"`
+	VPCID          int    `gorm:"column:epc_id;type:int;default:0" json:"EPC_ID"`
 	Domain         string `gorm:"column:domain;type:char(64);not null" json:"DOMAIN"`
 	AZ             string `gorm:"column:az;type:char(64);default:''" json:"AZ"`
 	Region         string `gorm:"column:region;type:char(64);default:''" json:"REGION"`
@@ -1042,6 +1042,8 @@ type VTapGroupConfiguration struct {
 	CollectorEnabled              *int    `gorm:"column:collector_enabled;type:tinyint(1);default:null" json:"COLLECTOR_ENABLED"`       // 0: disabled 1:enabled
 	VTapFlow1sEnabled             *int    `gorm:"column:vtap_flow_1s_enabled;type:tinyint(1);default:null" json:"VTAP_FLOW_1S_ENABLED"` // 0: disabled 1:enabled
 	L4LogTapTypes                 *string `gorm:"column:l4_log_tap_types;type:text;default:null" json:"L4_LOG_TAP_TYPES"`               // tap type info, separate by ","
+	L4LogIgnoreTapSides           *string `gorm:"column:l4_log_ignore_tap_sides;type:text;default:null" json:"L4_LOG_IGNORE_TAP_SIDES"` // separate by ","
+	L7LogIgnoreTapSides           *string `gorm:"column:l7_log_ignore_tap_sides;type:text;default:null" json:"L7_LOG_IGNORE_TAP_SIDES"` // separate by ","
 	NpbDedupEnabled               *int    `gorm:"column:npb_dedup_enabled;type:tinyint(1);default:null" json:"NPB_DEDUP_ENABLED"`       // 0: disabled 1:enabled
 	PlatformEnabled               *int    `gorm:"column:platform_enabled;type:tinyint(1);default:null" json:"PLATFORM_ENABLED"`         // 0: disabled 1:enabled
 	IfMacSource                   *int    `gorm:"column:if_mac_source;type:int;default:null" json:"IF_MAC_SOURCE"`                      // 0: 接口MAC 1: 接口名称 2: 虚拟机MAC解析
@@ -1114,6 +1116,8 @@ type RVTapGroupConfiguration struct {
 	CollectorEnabled              int    `gorm:"column:collector_enabled;type:tinyint(1);default:null" json:"COLLECTOR_ENABLED"`       // 0: disabled 1:enabled
 	VTapFlow1sEnabled             int    `gorm:"column:vtap_flow_1s_enabled;type:tinyint(1);default:null" json:"VTAP_FLOW_1S_ENABLED"` // 0: disabled 1:enabled
 	L4LogTapTypes                 string `gorm:"column:l4_log_tap_types;type:text;default:null" json:"L4_LOG_TAP_TYPES"`               // tap type info, separate by ","
+	L4LogIgnoreTapSides           string `gorm:"column:l4_log_ignore_tap_sides;type:text;default:null" json:"L4_LOG_IGNORE_TAP_SIDES"` // separate by ","
+	L7LogIgnoreTapSides           string `gorm:"column:l7_log_ignore_tap_sides;type:text;default:null" json:"L7_LOG_IGNORE_TAP_SIDES"` // separate by ","
 	NpbDedupEnabled               int    `gorm:"column:npb_dedup_enabled;type:tinyint(1);default:null" json:"NPB_DEDUP_ENABLED"`       // 0: disabled 1:enabled
 	PlatformEnabled               int    `gorm:"column:platform_enabled;type:tinyint(1);default:null" json:"PLATFORM_ENABLED"`         // 0: disabled 1:enabled
 	IfMacSource                   int    `gorm:"column:if_mac_source;type:int;default:null" json:"IF_MAC_SOURCE"`                      // 0: 接口MAC 1: 接口名称 2: 虚拟机MAC解析
