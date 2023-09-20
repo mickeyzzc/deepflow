@@ -25,14 +25,16 @@ use crate::{
     flow_generator::{
         error::{Error, Result},
         protocol_logs::{
-            consts::KAFKA_REQ_HEADER_LEN,
+            consts::{KAFKA_REQ_HEADER_LEN, KAFKA_RESP_HEADER_LEN},
             pb_adapter::{ExtendedInfo, L7ProtocolSendLog, L7Request, L7Response},
             value_is_default, value_is_negative, AppProtoHead, L7ResponseStatus, LogMessageType,
         },
     },
     utils::bytes::{read_i16_be, read_u16_be, read_u32_be},
 };
+use encoding_rs::UTF_16BE;
 
+const KAFKA_PRODUCE: u16 = 0;
 const KAFKA_FETCH: u16 = 1;
 
 #[derive(Serialize, Debug, Default, Clone)]
@@ -53,6 +55,8 @@ pub struct KafkaInfo {
     pub api_key: u16,
     #[serde(skip)]
     pub client_id: String,
+    #[serde(skip)]
+    pub topics: Option<String>,
 
     // reponse
     #[serde(rename = "response_length", skip_serializing_if = "value_is_negative")]
@@ -60,7 +64,7 @@ pub struct KafkaInfo {
     #[serde(rename = "response_status")]
     pub status: L7ResponseStatus,
     #[serde(rename = "response_code", skip_serializing_if = "Option::is_none")]
-    pub status_code: Option<i32>,
+    pub status_code: Option<i16>,
 
     rrt: u64,
 }
@@ -102,6 +106,9 @@ impl KafkaInfo {
         }
         if other.status_code != None {
             self.status_code = other.status_code;
+        }
+        if other.topics != None {
+            self.topics = other.topics;
         }
     }
 
@@ -189,16 +196,18 @@ impl KafkaInfo {
 impl From<KafkaInfo> for L7ProtocolSendLog {
     fn from(f: KafkaInfo) -> Self {
         let command_str = f.get_command();
+        let str_version = f.api_version.to_string();
         let log = L7ProtocolSendLog {
             req_len: f.req_msg_size,
             resp_len: f.resp_msg_size,
             req: L7Request {
-                req_type: String::from(command_str),
+                req_type: String::from(command_str) + "_v" + str_version.as_str(),
+                resource: f.topics.unwrap_or_default(),
                 ..Default::default()
             },
             resp: L7Response {
                 status: f.status,
-                code: f.status_code,
+                code: Some(f.status_code.unwrap_or(0).into()),
                 ..Default::default()
             },
             ext_info: Some(ExtendedInfo {
@@ -250,8 +259,9 @@ impl L7ProtocolParserInterface for KafkaLog {
                             self.set_status_code(
                                 req.api_key,
                                 req.api_version,
-                                read_i16_be(&payload[12..]),
+                                &payload[KAFKA_RESP_HEADER_LEN..],
                                 &mut info,
+                                None,
                             )
                         }
                     }
@@ -262,8 +272,9 @@ impl L7ProtocolParserInterface for KafkaLog {
                             self.set_status_code(
                                 info.api_key,
                                 info.api_version,
-                                resp.code,
+                                &payload[KAFKA_REQ_HEADER_LEN..],
                                 &mut info,
+                                Some(resp.code),
                             )
                         }
                     }
@@ -277,7 +288,7 @@ impl L7ProtocolParserInterface for KafkaLog {
             Some(KafkaInfoCache {
                 api_key: info.api_key,
                 api_version: info.api_version,
-                code: read_i16_be(&payload[12..]),
+                code: info.status_code.unwrap_or(0),
             }),
         )
         .map(|rrt| {
@@ -302,6 +313,81 @@ impl L7ProtocolParserInterface for KafkaLog {
     fn perf_stats(&mut self) -> Option<L7PerfStats> {
         self.perf_stats.take()
     }
+}
+
+// Kafka每个api key的不同版本有不同的固定偏移，这里返回固定的偏移。
+// 因版本太多且差异大，这里只实现最常见的produce和fetch两个api key。
+macro_rules! kafka_apiversion_topic_fixed_offset {
+    ($api_key:expr, $api_version:expr) => {
+        match $api_key {
+            KAFKA_PRODUCE => {
+                if $api_version <= 2 {
+                    // Offset for API version <= 2
+                    10
+                } else if $api_version <= 9 {
+                    // Offset for API version <= 9
+                    12
+                } else {
+                    // Invalid API version
+                    usize::max_value()
+                }
+            }
+            KAFKA_FETCH => {
+                if $api_version <= 2 {
+                    // Offset for API version <= 2
+                    16
+                } else if $api_version == 3 {
+                    // Offset for API version == 3
+                    20
+                } else if $api_version <= 6 {
+                    // Offset for API version <= 6
+                    21
+                } else if $api_version <= 12 {
+                    // Offset for API version <= 12
+                    29
+                } else {
+                    // Invalid API version
+                    usize::max_value()
+                }
+            }
+            _ => usize::max_value(),
+        }
+    };
+}
+
+macro_rules! kafka_apiversion_errcode_fixed_offset {
+    ($api_key:expr, $api_version:expr) => {
+        match $api_key {
+            KAFKA_PRODUCE => {
+                if $api_version <= 8 {
+                    // Offset for API version <= 2
+                    14
+                } else if $api_version <= 9 {
+                    // Offset for API version <= 9
+                    // TODO:
+                    usize::max_value()
+                } else {
+                    // Invalid API version
+                    usize::max_value()
+                }
+            }
+            KAFKA_FETCH => {
+                if $api_version == 0 {
+                    14
+                } else if $api_version <= 6 {
+                    // Offset for API version <= 6
+                    18
+                } else if $api_version <= 15 {
+                    // Offset for API version in [7..15]
+                    4
+                } else {
+                    // Invalid API version
+                    usize::max_value()
+                }
+            }
+            _ => usize::max_value(),
+        }
+    };
 }
 
 impl KafkaLog {
@@ -332,6 +418,13 @@ impl KafkaLog {
         if !info.client_id.is_ascii() {
             return Err(Error::KafkaLogParseFailed);
         }
+
+        info.topics = std::option::Option::<String>::from(self.get_topics_name(
+            info.api_key,
+            info.api_version,
+            &payload[14 + client_id_len..],
+        ));
+
         Ok(())
     }
 
@@ -352,20 +445,111 @@ impl KafkaLog {
         if proto != IpProtocol::TCP {
             return Err(Error::InvalidIpProtocol);
         }
-        if payload.len() < KAFKA_REQ_HEADER_LEN {
-            return Err(Error::KafkaLogParseFailed);
-        }
+
         match direction {
             PacketDirection::ClientToServer => {
+                if payload.len() < KAFKA_REQ_HEADER_LEN {
+                    return Err(Error::KafkaLogParseFailed);
+                }
                 self.request(payload, false, info)?;
                 self.perf_stats.as_mut().map(|p| p.inc_req());
             }
             PacketDirection::ServerToClient => {
+                if payload.len() < KAFKA_RESP_HEADER_LEN {
+                    return Err(Error::KafkaLogParseFailed);
+                }
                 self.response(payload, info)?;
                 self.perf_stats.as_mut().map(|p| p.inc_resp());
             }
         }
         Ok(())
+    }
+
+    fn get_topics_name(
+        &mut self,
+        api_key: u16,
+        api_version: u16,
+        payload: &[u8],
+    ) -> Option<String> {
+        let mut _fixed_offset = kafka_apiversion_topic_fixed_offset!(api_key, api_version);
+        if _fixed_offset == usize::max_value() {
+            return None;
+        }
+        match api_key {
+            KAFKA_PRODUCE => {
+                if api_version >= 3 && api_version <= 8 {
+                    let tid_len = read_i16_be(&payload[0..2]);
+                    if tid_len > 0 {
+                        _fixed_offset = _fixed_offset + tid_len as usize
+                    }
+                }
+                // 版本9是特别的
+                if api_version == 9 {
+                    let tid_len = payload[0];
+                    if tid_len > 0 {
+                        _fixed_offset = _fixed_offset + tid_len as usize
+                    }
+                    let (_, _, result) = UTF_16BE.decode(
+                        &payload
+                            [_fixed_offset.._fixed_offset + 1 + payload[_fixed_offset] as usize],
+                    );
+                    if result {
+                        return Some(
+                            String::from_utf8_lossy(
+                                &payload[_fixed_offset
+                                    .._fixed_offset + 1 + payload[_fixed_offset] as usize],
+                            )
+                            .into_owned(),
+                        );
+                    } else {
+                        return None;
+                    };
+                }
+                let len = read_u16_be(&payload[_fixed_offset.._fixed_offset + 2]);
+                if _fixed_offset + 2 + len as usize > payload.len() {
+                    return None;
+                }
+                return Some(
+                    String::from_utf8_lossy(
+                        &payload[_fixed_offset + 2.._fixed_offset + 2 + len as usize],
+                    )
+                    .into_owned(),
+                );
+            }
+            KAFKA_FETCH => {
+                // 版本12是一个过渡版本，前后的解码协议差异更大
+                if api_version == 12 {
+                    if payload.len() < _fixed_offset + 1 + payload[_fixed_offset] as usize {
+                        return None;
+                    }
+                    let (_, _, result) = UTF_16BE.decode(
+                        &payload
+                            [_fixed_offset.._fixed_offset + 1 + payload[_fixed_offset] as usize],
+                    );
+                    if result {
+                        return Some(
+                            String::from_utf8_lossy(
+                                &payload[_fixed_offset
+                                    .._fixed_offset + 1 + payload[_fixed_offset] as usize],
+                            )
+                            .into_owned(),
+                        );
+                    } else {
+                        return None;
+                    };
+                }
+                let len = read_u16_be(&payload[_fixed_offset.._fixed_offset + 2]);
+                return Some(
+                    String::from_utf8_lossy(
+                        &payload[_fixed_offset + 2.._fixed_offset + 2 + len as usize],
+                    )
+                    .into_owned(),
+                );
+            }
+            _ => {
+                return None;
+            }
+        }
     }
 
     /*
@@ -382,17 +566,68 @@ impl KafkaLog {
         &mut self,
         api_key: u16,
         api_version: u16,
-        code: i16,
+        payload: &[u8],
         info: &mut KafkaInfo,
+        code: Option<i16>,
     ) {
-        if api_key == KAFKA_FETCH && api_version >= 7 {
-            info.status_code = Some(code as i32);
-            if code == 0 {
+        if !code.is_none() {
+            if code == Some(0) {
                 info.status = L7ResponseStatus::Ok;
             } else {
                 info.status = L7ResponseStatus::ServerError;
                 self.perf_stats.as_mut().map(|p| p.inc_resp_err());
             }
+            return;
+        }
+        // no code decode
+        let mut _fixed_offset = kafka_apiversion_errcode_fixed_offset!(api_key, api_version);
+        if _fixed_offset == usize::max_value() {
+            return;
+        }
+        if payload.len() < _fixed_offset {
+            return;
+        }
+        let mut topic_len = 0;
+        match api_key {
+            KAFKA_PRODUCE => {
+                if api_version <= 8 {
+                    topic_len = read_i16_be(&payload[4..6]);
+                }
+                // 版本9是特别的，暂不支持
+                if api_version == 9 {
+                    return;
+                };
+            }
+            KAFKA_FETCH => {
+                if api_version == 0 {
+                    topic_len = read_i16_be(&payload[4..6]);
+                } else if api_version <= 6 {
+                    topic_len = read_i16_be(&payload[10..12]);
+                } else if api_version >= 12 {
+                    // 版本12是一个过渡版本，前后的解码协议差异更大
+                    return;
+                }
+            }
+            _ => {
+                return;
+            }
+        }
+        if topic_len > 0 {
+            _fixed_offset = _fixed_offset + topic_len as usize
+        }
+        if _fixed_offset + 2 > payload.len() {
+            return;
+        }
+        info.status_code = Some(
+            read_i16_be(&payload[_fixed_offset.._fixed_offset + 2])
+                .try_into()
+                .unwrap(),
+        );
+        if info.status_code == Some(0) {
+            info.status = L7ResponseStatus::Ok;
+        } else {
+            info.status = L7ResponseStatus::ServerError;
+            self.perf_stats.as_mut().map(|p| p.inc_resp_err());
         }
     }
 }
