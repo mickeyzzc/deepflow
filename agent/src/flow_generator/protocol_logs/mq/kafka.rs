@@ -196,12 +196,11 @@ impl KafkaInfo {
 impl From<KafkaInfo> for L7ProtocolSendLog {
     fn from(f: KafkaInfo) -> Self {
         let command_str = f.get_command();
-        let str_version = f.api_version.to_string();
         let log = L7ProtocolSendLog {
             req_len: f.req_msg_size,
             resp_len: f.resp_msg_size,
             req: L7Request {
-                req_type: String::from(command_str) + "_v" + str_version.as_str(),
+                req_type: format!("{}_v{}", command_str, f.api_version),
                 resource: f.topics.unwrap_or_default(),
                 ..Default::default()
             },
@@ -330,34 +329,34 @@ macro_rules! kafka_apiversion_topic_fixed_offset {
             KAFKA_PRODUCE => {
                 if $api_version <= 2 {
                     // Offset for API version <= 2
-                    10
+                    Some(10)
                 } else if $api_version <= 9 {
                     // Offset for API version <= 9
-                    12
+                    Some(12)
                 } else {
                     // Invalid API version
-                    usize::max_value()
+                    None
                 }
             }
             KAFKA_FETCH => {
                 if $api_version <= 2 {
                     // Offset for API version <= 2
-                    16
+                    Some(16)
                 } else if $api_version == 3 {
                     // Offset for API version == 3
-                    20
+                    Some(20)
                 } else if $api_version <= 6 {
                     // Offset for API version <= 6
-                    21
+                    Some(21)
                 } else if $api_version <= 12 {
                     // Offset for API version <= 12
-                    29
+                    Some(29)
                 } else {
                     // Invalid API version
-                    usize::max_value()
+                    None
                 }
             }
-            _ => usize::max_value(),
+            _ => None,
         }
     };
 }
@@ -368,31 +367,31 @@ macro_rules! kafka_apiversion_errcode_fixed_offset {
             KAFKA_PRODUCE => {
                 if $api_version <= 8 {
                     // Offset for API version <= 8
-                    14
+                    Some(14)
                 } else if $api_version <= 9 {
                     // Offset for API version <= 9
                     // TODO:
-                    usize::max_value()
+                    None
                 } else {
                     // Invalid API version
-                    usize::max_value()
+                    None
                 }
             }
             KAFKA_FETCH => {
                 if $api_version == 0 {
-                    14
+                    Some(14)
                 } else if $api_version <= 6 {
                     // Offset for API version <= 6
-                    18
+                    Some(18)
                 } else if $api_version <= 15 {
                     // Offset for API version in [7..15]
-                    4
+                    Some(4)
                 } else {
                     // Invalid API version
-                    usize::max_value()
+                    None
                 }
             }
-            _ => usize::max_value(),
+            _ => None,
         }
     };
 }
@@ -426,11 +425,11 @@ impl KafkaLog {
             return Err(Error::KafkaLogParseFailed);
         }
 
-        info.topics = std::option::Option::<String>::from(self.get_topics_name(
+        info.topics = self.get_topics_name(
             info.api_key,
             info.api_version,
             &payload[14 + client_id_len..],
-        ));
+        );
 
         Ok(())
     }
@@ -479,38 +478,41 @@ impl KafkaLog {
         payload: &[u8],
     ) -> Option<String> {
         let mut _fixed_offset = kafka_apiversion_topic_fixed_offset!(api_key, api_version);
-        if _fixed_offset == usize::max_value() {
+        if _fixed_offset.is_none() {
             return None;
         }
-        if _fixed_offset > payload.len() {
+        let mut fixed_offset = _fixed_offset.unwrap();
+        if fixed_offset > payload.len() {
             return None;
         }
+        
         match api_key {
             KAFKA_PRODUCE => {
                 if api_version >= 3 && api_version <= 8 {
                     let tid_len = read_i16_be(&payload[0..2]);
                     if tid_len > 0 {
-                        _fixed_offset = _fixed_offset + tid_len as usize
+                        fixed_offset = fixed_offset + tid_len as usize
                     }
                 }
                 // Significant improvements since version 9
                 if api_version == 9 {
                     let tid_len = payload[0];
                     if tid_len > 0 {
-                        _fixed_offset = _fixed_offset + tid_len as usize
+                        fixed_offset = fixed_offset + tid_len as usize
                     }
-                    if _fixed_offset + 1 + payload[_fixed_offset] as usize > payload.len() {
+                    if fixed_offset + 1 + payload[fixed_offset] as usize > payload.len() {
                         return None;
                     }
+                    // todo：code optimization
                     let (_, _, result) = UTF_16BE.decode(
                         &payload
-                            [_fixed_offset.._fixed_offset + 1 + payload[_fixed_offset] as usize],
+                            [fixed_offset..fixed_offset + 1 + payload[fixed_offset] as usize],
                     );
                     if result {
                         return Some(
                             String::from_utf8_lossy(
-                                &payload[_fixed_offset
-                                    .._fixed_offset + 1 + payload[_fixed_offset] as usize],
+                                &payload[fixed_offset
+                                    ..fixed_offset + 1 + payload[fixed_offset] as usize],
                             )
                             .into_owned(),
                         );
@@ -518,16 +520,16 @@ impl KafkaLog {
                         return None;
                     };
                 }
-                if _fixed_offset + 2 > payload.len() {
+                if fixed_offset + 2 > payload.len() {
                     return None;
                 }
-                let len = read_u16_be(&payload[_fixed_offset.._fixed_offset + 2]);
-                if _fixed_offset + 2 + len as usize > payload.len() {
+                let len = read_u16_be(&payload[fixed_offset..fixed_offset + 2]);
+                if fixed_offset + 2 + len as usize > payload.len() {
                     return None;
                 }
                 return Some(
                     String::from_utf8_lossy(
-                        &payload[_fixed_offset + 2.._fixed_offset + 2 + len as usize],
+                        &payload[fixed_offset + 2..fixed_offset + 2 + len as usize],
                     )
                     .into_owned(),
                 );
@@ -535,18 +537,18 @@ impl KafkaLog {
             KAFKA_FETCH => {
                 // The 12th version is a transitional version, and the decoding protocols of the previous versions are more different.
                 if api_version == 12 {
-                    if payload.len() < _fixed_offset + 1 + payload[_fixed_offset] as usize {
+                    if payload.len() < fixed_offset + 1 + payload[fixed_offset] as usize {
                         return None;
                     }
                     let (_, _, result) = UTF_16BE.decode(
                         &payload
-                            [_fixed_offset.._fixed_offset + 1 + payload[_fixed_offset] as usize],
+                            [fixed_offset..fixed_offset + 1 + payload[fixed_offset] as usize],
                     );
                     if result {
                         return Some(
                             String::from_utf8_lossy(
-                                &payload[_fixed_offset
-                                    .._fixed_offset + 1 + payload[_fixed_offset] as usize],
+                                &payload[fixed_offset
+                                    ..fixed_offset + 1 + payload[fixed_offset] as usize],
                             )
                             .into_owned(),
                         );
@@ -554,13 +556,13 @@ impl KafkaLog {
                         return None;
                     };
                 }
-                let topic_len = read_u16_be(&payload[_fixed_offset.._fixed_offset + 2]);
-                if _fixed_offset + 2 + topic_len as usize > payload.len() {
+                let topic_len = read_u16_be(&payload[fixed_offset..fixed_offset + 2]);
+                if fixed_offset + 2 + topic_len as usize > payload.len() {
                     return None;
                 }
                 return Some(
                     String::from_utf8_lossy(
-                        &payload[_fixed_offset + 2.._fixed_offset + 2 + topic_len as usize],
+                        &payload[fixed_offset + 2..fixed_offset + 2 + topic_len as usize],
                     )
                     .into_owned(),
                 );
@@ -589,10 +591,10 @@ impl KafkaLog {
         info: &mut KafkaInfo,
         code: Option<i16>,
     ) {
-        if code != None {
-            if code == Some(0) {
+        if let Some(code) = code {
+            if code == 0 {
                 info.status = L7ResponseStatus::Ok;
-                info.status_code = code;
+                info.status_code = Some(code);
             } else {
                 info.status = L7ResponseStatus::ServerError;
                 self.perf_stats.as_mut().map(|p| p.inc_resp_err());
@@ -600,10 +602,11 @@ impl KafkaLog {
             return;
         }
         let mut _fixed_offset = kafka_apiversion_errcode_fixed_offset!(api_key, api_version);
-        if _fixed_offset == usize::max_value() {
+        if _fixed_offset.is_none() {
             return;
         }
-        if payload.len() < _fixed_offset {
+        let mut fixed_offset = _fixed_offset.unwrap();
+        if payload.len() < fixed_offset {
             return;
         }
         let mut topic_len = 0;
@@ -632,13 +635,13 @@ impl KafkaLog {
             }
         }
         if topic_len > 0 {
-            _fixed_offset = _fixed_offset + topic_len as usize
+            fixed_offset = fixed_offset + topic_len as usize
         }
-        if _fixed_offset + 2 > payload.len() {
+        if fixed_offset + 2 > payload.len() {
             return;
         }
         info.status_code = Some(
-            read_i16_be(&payload[_fixed_offset.._fixed_offset + 2])
+            read_i16_be(&payload[fixed_offset..fixed_offset + 2])
                 .try_into()
                 .unwrap(),
         );
